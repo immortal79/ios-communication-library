@@ -120,9 +120,7 @@ import Alamofire
     }
     
     func encodeUrlString(_ string: String) -> URLConvertible? {
-        
-        let allowedCharacterSet = (CharacterSet(charactersIn: " ").inverted)
-        if let escapedString = string.addingPercentEncoding(withAllowedCharacters: allowedCharacterSet) {            
+        if let escapedString = string.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
             var url: URLConvertible
             do {
                 try url = escapedString.asURL()
