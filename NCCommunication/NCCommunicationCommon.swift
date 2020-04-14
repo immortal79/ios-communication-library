@@ -56,10 +56,7 @@ import Alamofire
     @objc let sessionIdentifierBackground: String = "com.nextcloud.session.background"
     @objc let sessionIdentifierBackgroundwifi: String = "com.nextcloud.session.backgroundwifi"
     @objc let sessionIdentifierExtension: String = "com.nextcloud.session.extension"
-    
-    // Constant
-    let k_encodeCharacterSet = " #;?@&=$+{}<>,!'*"
-    
+        
     //MARK: - Setup
     
     @objc public func setup(user: String, userId: String, password: String, url: String, userAgent: String?, capabilitiesGroup: String?, nextcloudVersion: Int, delegate: NCCommunicationCommonDelegate?) {
@@ -149,8 +146,7 @@ import Alamofire
         
     func encodeStringToUrl(_ string: String) -> URLConvertible? {
         
-        let allowedCharacterSet = (CharacterSet(charactersIn: k_encodeCharacterSet).inverted)
-        if let escapedString = string.addingPercentEncoding(withAllowedCharacters: allowedCharacterSet) {            
+        if let escapedString = string.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
             var url: URLConvertible
             do {
                 try url = escapedString.asURL()
@@ -163,9 +159,7 @@ import Alamofire
     }
     
     func encodeString(_ string: String) -> String? {
-        
-        let allowedCharacterSet = (CharacterSet(charactersIn: k_encodeCharacterSet).inverted)
-        return string.addingPercentEncoding(withAllowedCharacters: allowedCharacterSet)
+        return string.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)
     }
         
     func StringToUrl(_ string: String) -> URLConvertible? {
