@@ -24,34 +24,100 @@
 import Foundation
 import UIKit
 import Alamofire
-import SwiftyXMLParser
 import SwiftyJSON
 
 @objc public class NCCommunication: SessionDelegate {
-    @objc public static let sharedInstance: NCCommunication = {
+    @objc public static let shared: NCCommunication = {
         let instance = NCCommunication()
         return instance
     }()
-    
-    // Session Manager
-    
-    private lazy var sessionManager: Alamofire.Session = {
+            
+    internal lazy var sessionManager: Alamofire.Session = {
         let configuration = URLSessionConfiguration.af.default
-        return Alamofire.Session(configuration: configuration, delegate: self, rootQueue:  DispatchQueue(label: "com.nextcloud.sessionManagerData.rootQueue"), startRequestsImmediately: true, requestQueue: nil, serializationQueue: nil, interceptor: nil, serverTrustManager: nil, redirectHandler: nil, cachedResponseHandler: nil, eventMonitors: self.makeEvents())
+        return Alamofire.Session(configuration: configuration, delegate: self, rootQueue: DispatchQueue(label: "com.nextcloud.sessionManagerData.rootQueue"), startRequestsImmediately: true, requestQueue: nil, serializationQueue: nil, interceptor: nil, serverTrustManager: nil, redirectHandler: nil, cachedResponseHandler: nil, eventMonitors: [AlamofireLogger()])
     }()
     
-    //MARK: - HTTP Headers
+    private let reachabilityManager = Alamofire.NetworkReachabilityManager()
     
-    private func getStandardHeaders() -> HTTPHeaders {
+    override public init(fileManager: FileManager = .default) {
+        super.init(fileManager: fileManager)
         
-        var headers: HTTPHeaders = [.authorization(username: NCCommunicationCommon.sharedInstance.user, password: NCCommunicationCommon.sharedInstance.password)]
-        if let userAgent = NCCommunicationCommon.sharedInstance.userAgent { headers.update(.userAgent(userAgent)) }
-        headers.update(name: "OCS-APIRequest", value: "true")
+        NotificationCenter.default.addObserver(self, selector: #selector(changeUser(_:)), name: NSNotification.Name(rawValue: "changeUser"), object: nil)
         
-        return headers
+        startNetworkReachabilityObserver()
     }
     
-    //MARK: - monitor
+    //MARK: - Notification Center
+    
+    @objc func changeUser(_ notification: NSNotification) {
+        sessionDeleteCookies()
+    }
+    
+    //MARK: -  Cookies
+   
+    internal func saveCookiesTEST(response : HTTPURLResponse?) {
+        if let headerFields = response?.allHeaderFields as? [String : String] {
+            if let url = URL(string: NCCommunicationCommon.shared.urlBase) {
+                let cookies = HTTPCookie.cookies(withResponseHeaderFields: headerFields, for: url)
+                if cookies.count > 0 {
+                    NCCommunicationCommon.shared.cookies[NCCommunicationCommon.shared.account] = cookies
+                } else {
+                    NCCommunicationCommon.shared.cookies[NCCommunicationCommon.shared.account] = nil
+                }
+            }
+        }
+    }
+    
+    internal func injectsCookiesTEST() {
+        if let cookies = NCCommunicationCommon.shared.cookies[NCCommunicationCommon.shared.account] {
+            if let url = URL(string: NCCommunicationCommon.shared.urlBase) {
+                sessionManager.session.configuration.httpCookieStorage?.setCookies(cookies, for: url, mainDocumentURL: nil)
+            }
+        }
+    }
+    
+    internal func sessionDeleteCookies() {
+        if let cookieStore = sessionManager.session.configuration.httpCookieStorage {
+            for cookie in cookieStore.cookies ?? [] {
+                cookieStore.deleteCookie(cookie)
+            }
+        }
+    }
+        
+    //MARK: - Reachability
+    
+    @objc public func isNetworkReachable() -> Bool {
+        return reachabilityManager?.isReachable ?? false
+    }
+    
+    private func startNetworkReachabilityObserver() {
+        
+        reachabilityManager?.startListening(onUpdatePerforming: { (status) in
+            switch status {
+
+            case .unknown :
+                NCCommunicationCommon.shared.delegate?.networkReachabilityObserver?(NCCommunicationCommon.typeReachability.unknown)
+
+            case .notReachable:
+                NCCommunicationCommon.shared.delegate?.networkReachabilityObserver?(NCCommunicationCommon.typeReachability.notReachable)
+                
+            case .reachable(.ethernetOrWiFi):
+                NCCommunicationCommon.shared.delegate?.networkReachabilityObserver?(NCCommunicationCommon.typeReachability.reachableEthernetOrWiFi)
+
+            case .reachable(.cellular):
+                NCCommunicationCommon.shared.delegate?.networkReachabilityObserver?(NCCommunicationCommon.typeReachability.reachableCellular)
+            }
+        })
+    }
+    
+    //MARK: - Session utility
+        
+    @objc public func getSessionManager() -> URLSession {
+       return sessionManager.session
+    }
+    
+    /*
+    //MARK: -
     
     private func makeEvents() -> [EventMonitor] {
         
@@ -71,892 +137,25 @@ import SwiftyJSON
         }
         return [events]
     }
+    */
     
-    //MARK: - webDAV
+    //MARK: - download / upload
+    
+    @objc public func download(serverUrlFileName: String, fileNameLocalPath: String, customUserAgent: String? = nil, addCustomHeaders: [String: String]? = nil, progressHandler: @escaping (_ progress: Progress) -> Void , completionHandler: @escaping (_ account: String, _ etag: String?, _ date: NSDate?, _ lenght: Double, _ errorCode: Int, _ errorDescription: String) -> Void) {
+        
+        download(serverUrlFileName: serverUrlFileName, fileNameLocalPath: fileNameLocalPath, customUserAgent: customUserAgent, addCustomHeaders: addCustomHeaders, requestHandler: { (_) in }, progressHandler: progressHandler) { (account, etag, date, lenght, error, errorCode, errorDescription) in
+            
+            completionHandler(account, etag, date, lenght, errorCode, errorDescription)
+        }
+    }
+    
+    public func download(serverUrlFileName: String, fileNameLocalPath: String, customUserAgent: String? = nil, addCustomHeaders: [String: String]? = nil, requestHandler: @escaping (_ request: DownloadRequest) -> Void, progressHandler: @escaping (_ progress: Progress) -> Void , completionHandler: @escaping (_ account: String, _ etag: String?, _ date: NSDate?, _ lenght: Double, _ error: AFError?, _ errorCode: Int, _ errorDescription: String) -> Void) {
+        
+        let account = NCCommunicationCommon.shared.account
 
-    @objc public func createFolder(_ serverUrlFileName: String, account: String, completionHandler: @escaping (_ account: String, _ ocId: String?, _ date: NSDate?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        guard let url = NCCommunicationCommon.sharedInstance.encodeStringToUrl(serverUrlFileName) else {
-            completionHandler(account, nil, nil, NSURLErrorUnsupportedURL, "Invalid server url")
+        guard let url = NCCommunicationCommon.shared.encodeStringToUrl(serverUrlFileName) else {
+            completionHandler(account, nil, nil, 0, nil, NSURLErrorBadURL, NSLocalizedString("_invalid_url_", value: "Invalid server url", comment: ""))
             return
-        }
-        
-        let method = HTTPMethod(rawValue: "MKCOL")
-        let headers = getStandardHeaders()
-
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).response { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, nil, error.errorCode, error.description)
-            case .success( _):
-                let ocId = NCCommunicationCommon.sharedInstance.findHeader("oc-fileid", allHeaderFields: response.response?.allHeaderFields)
-                if let dateString = NCCommunicationCommon.sharedInstance.findHeader("date", allHeaderFields: response.response?.allHeaderFields) {
-                    if let date = NCCommunicationCommon.sharedInstance.convertDate(dateString, format: "EEE, dd MMM y HH:mm:ss zzz") {
-                        completionHandler(account, ocId, date, 0, nil)
-                    } else { completionHandler(account, nil, nil, NSURLErrorBadServerResponse, "Response error decode date format") }
-                } else { completionHandler(account, nil, nil, NSURLErrorBadServerResponse, "Response error decode date format") }
-            }
-        }
-    }
-    
-    @objc public func deleteFileOrFolder(_ serverUrlFileName: String, account: String, completionHandler: @escaping (_ account: String, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        guard let url = NCCommunicationCommon.sharedInstance.encodeStringToUrl(serverUrlFileName) else {
-            completionHandler(account, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "DELETE")
-        let headers = getStandardHeaders()
-
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).response { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, error.errorCode, error.description)
-            case .success( _):
-                completionHandler(account, 0, nil)
-            }
-        }
-    }
-    
-    @objc public func moveFileOrFolder(serverUrlFileNameSource: String, serverUrlFileNameDestination: String, overwrite: Bool, account: String, completionHandler: @escaping (_ account: String, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        guard let url = NCCommunicationCommon.sharedInstance.encodeStringToUrl(serverUrlFileNameSource) else {
-            completionHandler(account, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "MOVE")
-        
-        var headers = getStandardHeaders()
-        headers.update(name: "Destination", value: serverUrlFileNameDestination.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")
-        if overwrite {
-            headers.update(name: "Overwrite", value: "T")
-        } else {
-            headers.update(name: "Overwrite", value: "F")
-        }
-        
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).response { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, error.errorCode, error.description)
-            case .success( _):
-                completionHandler(account, 0, nil)
-            }
-        }
-    }
-    
-    @objc public func copyFileOrFolder(serverUrlFileNameSource: String, serverUrlFileNameDestination: String, overwrite: Bool,account: String, completionHandler: @escaping (_ account: String, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        guard let url = NCCommunicationCommon.sharedInstance.encodeStringToUrl(serverUrlFileNameSource) else {
-            completionHandler(account, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "COPY")
-        
-        var headers = getStandardHeaders()
-        headers.update(name: "Destination", value: serverUrlFileNameDestination.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")
-        if overwrite {
-            headers.update(name: "Overwrite", value: "T")
-        } else {
-            headers.update(name: "Overwrite", value: "F")
-        }
-        
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).response { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, error.errorCode, error.description)
-            case .success( _):
-                completionHandler(account, 0, nil)
-            }
-        }
-    }
-    
-    @objc public func readFileOrFolder(serverUrlFileName: String, depth: String, showHiddenFiles: Bool, account: String, completionHandler: @escaping (_ account: String, _ files: [NCFile]?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        var serverUrlFileName = String(serverUrlFileName)
-        if depth == "1" && serverUrlFileName.last != "/" { serverUrlFileName = serverUrlFileName + "/" }
-        if depth == "0" && serverUrlFileName.last == "/" { serverUrlFileName = String(serverUrlFileName.remove(at: serverUrlFileName.index(before: serverUrlFileName.endIndex))) }
-        guard let url = NCCommunicationCommon.sharedInstance.encodeStringToUrl(serverUrlFileName) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "PROPFIND")
-        
-        var headers = getStandardHeaders()
-        headers.update(.contentType("application/xml"))
-        headers.update(name: "Depth", value: depth)
-
-        // request
-        var urlRequest: URLRequest
-        do {
-            try urlRequest = URLRequest(url: url, method: method, headers: headers)
-            urlRequest.httpBody = NCDataFileXML().requestBodyFile.data(using: .utf8)
-        } catch {
-            completionHandler(account, nil, error._code, error.localizedDescription)
-            return
-        }
-        
-        sessionManager.request(urlRequest).validate(statusCode: 200..<300).responseData { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, error.errorCode, error.description)
-            case .success( _):
-                if let data = response.data {
-                    let files = NCDataFileXML().convertDataFile(data: data, showHiddenFiles: showHiddenFiles)
-                    completionHandler(account, files, 0, nil)
-                } else {
-                    completionHandler(account, nil, NSURLErrorBadServerResponse, "Response error decode XML")
-                }
-            }
-        }
-    }
-    
-    @objc public func searchLiteral(serverUrl: String, user: String, depth: String, literal: String, showHiddenFiles: Bool, account: String, completionHandler: @escaping (_ account: String, _ files: [NCFile]?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        guard let href = NCCommunicationCommon.sharedInstance.encodeString("/files/" + user ) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        guard let literal = NCCommunicationCommon.sharedInstance.encodeString(literal) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-       
-        let requestBody = String(format: NCDataFileXML().requestBodySearchFileName, href, depth, "%"+literal+"%")
-        let httpBody = requestBody.data(using: .utf8)!
-    
-        search(serverUrl: serverUrl, account: account, httpBody: httpBody, showHiddenFiles: showHiddenFiles) { (account, files, erroCode, errorDescription) in
-            completionHandler(account,files,erroCode,errorDescription)
-        }
-    }
-   
-    @objc public func searchMedia(serverUrl: String, user: String, lteDateLastModified: Date, gteDateLastModified: Date, showHiddenFiles: Bool, account: String, completionHandler: @escaping (_ account: String, _ files: [NCFile]?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-           
-        guard let href = NCCommunicationCommon.sharedInstance.encodeString("/files/" + user ) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        guard let lteDateLastModifiedString = NCCommunicationCommon.sharedInstance.convertDate(lteDateLastModified, format: "yyyy-MM-dd'T'HH:mm:ssZZZZZ") else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        guard let gteDateLastModifiedString = NCCommunicationCommon.sharedInstance.convertDate(gteDateLastModified, format: "yyyy-MM-dd'T'HH:mm:ssZZZZZ") else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let requestBody = String(format: NCDataFileXML().requestBodySearchMedia, href, lteDateLastModifiedString, gteDateLastModifiedString)
-        let httpBody = requestBody.data(using: .utf8)!
-       
-        search(serverUrl: serverUrl, account: account, httpBody: httpBody, showHiddenFiles: showHiddenFiles) { (account, files, erroCode, errorDescription) in
-            completionHandler(account,files,erroCode,errorDescription)
-        }
-    }
-    
-    private func search(serverUrl: String, account: String, httpBody: Data, showHiddenFiles: Bool, completionHandler: @escaping (_ account: String, _ files: [NCFile]?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        guard let url = NCCommunicationCommon.sharedInstance.encodeStringToUrl(serverUrl + "/" + NCCommunicationCommon.sharedInstance.davRoot) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "SEARCH")
-        
-        var headers = getStandardHeaders()
-        headers.update(.contentType("text/xml"))
-        
-        // request
-        var urlRequest: URLRequest
-        do {
-            try urlRequest = URLRequest(url: url, method: method, headers: headers)
-            urlRequest.httpBody = httpBody
-        } catch {
-            completionHandler(account, nil, error._code, error.localizedDescription)
-            return
-        }
-        
-        sessionManager.request(urlRequest).validate(statusCode: 200..<300).responseData { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, error.errorCode, error.description)
-            case .success( _):
-                if let data = response.data {
-                    let files = NCDataFileXML().convertDataFile(data: data, showHiddenFiles: showHiddenFiles)
-                    completionHandler(account, files, 0, nil)
-                } else {
-                    completionHandler(account, nil, NSURLErrorBadServerResponse, "Response error decode XML")
-                }
-            }
-        }
-    }
-    
-    @objc public func setFavorite(serverUrl: String, fileName: String, favorite: Bool, account: String, completionHandler: @escaping (_ account: String, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        let serverUrlFileName = serverUrl + "/" + NCCommunicationCommon.sharedInstance.davRoot + "/files/" + NCCommunicationCommon.sharedInstance.userId + "/" + fileName
-        guard let url = NCCommunicationCommon.sharedInstance.encodeStringToUrl(serverUrlFileName) else {
-            completionHandler(account, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "PROPPATCH")
-        let headers = getStandardHeaders()
-        
-        var urlRequest: URLRequest
-        do {
-            try urlRequest = URLRequest(url: url, method: method, headers: headers)
-            let body = NSString.init(format: NCDataFileXML().requestBodyFileSetFavorite as NSString, (favorite ? 1 : 0)) as String
-            urlRequest.httpBody = body.data(using: .utf8)
-        } catch {
-            completionHandler(account, error._code, error.localizedDescription)
-            return
-        }
-        
-        sessionManager.request(urlRequest).validate(statusCode: 200..<300).response { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, error.errorCode, error.description)
-            case .success( _):
-                completionHandler(account, 0, nil)
-            }
-        }
-    }
-    
-    @objc public func listingFavorites(serverUrl: String, showHiddenFiles: Bool, account: String, completionHandler: @escaping (_ account: String, _ files: [NCFile]?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        let serverUrlFileName = serverUrl + "/" + NCCommunicationCommon.sharedInstance.davRoot + "/files/" + NCCommunicationCommon.sharedInstance.userId
-        guard let url = NCCommunicationCommon.sharedInstance.encodeStringToUrl(serverUrlFileName) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "REPORT")
-        let headers = getStandardHeaders()
-        
-        var urlRequest: URLRequest
-        do {
-            try urlRequest = URLRequest(url: url, method: method, headers: headers)
-            urlRequest.httpBody = NCDataFileXML().requestBodyFileListingFavorites.data(using: .utf8)
-        } catch {
-            completionHandler(account, nil, error._code, error.localizedDescription)
-            return
-        }
-        
-        sessionManager.request(urlRequest).validate(statusCode: 200..<300).responseData { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, error.errorCode, error.description)
-            case .success( _):
-                if let data = response.data {
-                    let files = NCDataFileXML().convertDataFile(data: data, showHiddenFiles: showHiddenFiles)
-                    completionHandler(account, files, 0, nil)
-                } else {
-                    completionHandler(account, nil, NSURLErrorBadServerResponse, "Response error decode XML")
-                }
-            }
-        }
-    }
-    
-    //MARK: - Login flow v2
-    
-    @objc public func getLoginFlowV2(serverUrl: String, completionHandler: @escaping (_ token: String?, _ endpoint: String? , _ login: String?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-                
-        var serverUrl = String(serverUrl)
-        if serverUrl.last != "/" { serverUrl = serverUrl + "/" }
-        serverUrl = serverUrl + "index.php/login/v2"
-        guard let url = NCCommunicationCommon.sharedInstance.encodeStringToUrl(serverUrl) else {
-            completionHandler(nil, nil, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "POST")
-        
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: nil, interceptor: nil).validate(statusCode: 200..<300).responseJSON { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(nil, nil, nil, error.errorCode, error.description)
-            case .success(let json):
-                let json = JSON(json)
-               
-                let token = json["poll"]["token"].string
-                let endpoint = json["poll"]["endpoint"].string
-                let login = json["login"].string
-                
-                completionHandler(token, endpoint, login, 0, "")
-            }
-        }
-    }
-    
-    @objc public func getLoginFlowV2Poll(token: String, endpoint: String, completionHandler: @escaping (_ server: String?, _ loginName: String? , _ appPassword: String?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-                
-        let serverUrl = endpoint + "?token=" + token
-        guard let url = NCCommunicationCommon.sharedInstance.StringToUrl(serverUrl) else {
-            completionHandler(nil, nil, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-
-        let method = HTTPMethod(rawValue: "POST")
-        
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: nil, interceptor: nil).validate(statusCode: 200..<300).responseJSON { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(nil, nil, nil, error.errorCode, error.description)
-            case .success(let json):
-                let json = JSON(json)
-               
-                let server = json["server"].string
-                let loginName = json["loginName"].string
-                let appPassword = json["appPassword"].string
-                
-                completionHandler(server, loginName, appPassword, 0, "")
-            }
-        }
-    }
-    
-    //MARK: - API
-    
-    @objc public func iosHelper(serverUrl: String, fileNamePath: String, offset: Int, limit: Int, account: String, completionHandler: @escaping (_ account: String, _ files: [NCFile]?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        guard var serverUrl = NCCommunicationCommon.sharedInstance.encodeString(serverUrl) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        if serverUrl.last != "/" { serverUrl = serverUrl + "/" }
-        
-        guard let fileNamePath = NCCommunicationCommon.sharedInstance.encodeString(fileNamePath) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        serverUrl = serverUrl + "index.php/apps/ioshelper/api/v1/list?dir=" + fileNamePath + "&offset=\(offset)&limit=\(limit)"
-        
-        guard let url = NCCommunicationCommon.sharedInstance.StringToUrl(serverUrl) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-               
-        let method = HTTPMethod(rawValue: "GET")
-        let headers = getStandardHeaders()
-        
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).responseJSON { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, error.errorCode, error.description)
-            case .success(let json):
-                var files = [NCFile]()
-                let json = JSON(json)
-                for (_, subJson):(String, JSON) in json {
-                    let file = NCFile()
-                    if let modificationDate = subJson["modificationDate"].double {
-                        let date = Date(timeIntervalSince1970: modificationDate) as NSDate
-                        file.date = date
-                    }
-                    if let directory = subJson["directory"].bool { file.directory = directory }
-                    if let etag = subJson["etag"].string { file.etag = etag }
-                    if let favorite = subJson["favorite"].bool { file.favorite = favorite }
-                    if let fileId = subJson["fileId"].int { file.fileId = String(fileId) }
-                    if let hasPreview = subJson["hasPreview"].bool { file.hasPreview = hasPreview }
-                    if let mimetype = subJson["mimetype"].string { file.contentType = mimetype }
-                    if let name = subJson["name"].string { file.fileName = name }
-                    if let ocId = subJson["ocId"].string { file.ocId = ocId }
-                    if let permissions = subJson["permissions"].string { file.permissions = permissions }
-                    if let size = subJson["size"].double { file.size = size }
-                    files.append(file)
-                }
-                completionHandler(account, files, 0, nil)
-            }
-        }
-    }
-    
-    @objc public func downloadPreview(serverUrlPath: String, fileNameLocalPath: String, account: String, completionHandler: @escaping (_ account: String, _ data: Data?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        guard let url = NCCommunicationCommon.sharedInstance.StringToUrl(serverUrlPath) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "GET")
-        let headers = getStandardHeaders()
-                
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).response { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, error.errorCode, error.description)
-            case .success( _):
-                if let data = response.data {
-                    do {
-                        let url = URL.init(fileURLWithPath: fileNameLocalPath)
-                        try data.write(to: url, options: .atomic)
-                        completionHandler(account, data, 0, nil)
-                    } catch {
-                        completionHandler(account, nil, error._code, error.localizedDescription)
-                    }
-                } else {
-                    completionHandler(account, nil, NSURLErrorCannotDecodeContentData, "Response error data null")
-                }
-            }
-        }
-    }
-    
-    @objc public func downloadPreview(serverUrl: String, fileNamePath: String, fileNameLocalPath: String, width: Int, height: Int, account: String, completionHandler: @escaping (_ account: String, _ data: Data?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        guard var serverUrl = NCCommunicationCommon.sharedInstance.encodeString(serverUrl) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        if serverUrl.last != "/" { serverUrl = serverUrl + "/" }
-        
-        guard let fileNamePath = NCCommunicationCommon.sharedInstance.encodeString(fileNamePath) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        serverUrl = serverUrl + "index.php/core/preview.png?file=" + fileNamePath + "&x=\(width)&y=\(height)&a=1&mode=cover"
-        
-        guard let url = NCCommunicationCommon.sharedInstance.StringToUrl(serverUrl) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "GET")
-        let headers = getStandardHeaders()
-                
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).response { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, error.errorCode, error.description)
-            case .success( _):
-                if let data = response.data {
-                    do {
-                        let url = URL.init(fileURLWithPath: fileNameLocalPath)
-                        try data.write(to: url, options: .atomic)
-                        completionHandler(account, data, 0, nil)
-                    } catch {
-                        completionHandler(account, nil, error._code, error.localizedDescription)
-                    }
-                } else {
-                    completionHandler(account, nil, NSURLErrorCannotDecodeContentData, "Response error data null")
-                }
-            }
-        }
-    }
-    
-    @objc public func downloadPreviewTrash(serverUrl: String, fileId: String, fileNameLocalPath: String, width: Int, height: Int, account: String, completionHandler: @escaping (_ account: String, _ data: Data?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        guard var serverUrl = NCCommunicationCommon.sharedInstance.encodeString(serverUrl) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        if serverUrl.last != "/" { serverUrl = serverUrl + "/" }
-
-        serverUrl = serverUrl + "index.php/apps/files_trashbin/preview?fileId=" + fileId + "&x=\(width)&y=\(height)"
-        
-        guard let url = NCCommunicationCommon.sharedInstance.StringToUrl(serverUrl) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "GET")
-        let headers = getStandardHeaders()
-                
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).response { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, error.errorCode, error.description)
-            case .success( _):
-                if let data = response.data {
-                    do {
-                        let url = URL.init(fileURLWithPath: fileNameLocalPath)
-                        try  data.write(to: url, options: .atomic)
-                        completionHandler(account, data, 0, nil)
-                    } catch {
-                        completionHandler(account, nil, error._code, error.localizedDescription)
-                    }
-                } else {
-                    completionHandler(account, nil, NSURLErrorCannotDecodeContentData, "Response error data null")
-                }
-            }
-        }
-    }
-    
-    @objc public func getExternalSite(serverUrl: String, account: String, completionHandler: @escaping (_ account: String, _ externalFiles: [NCExternalFile], _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        var externalFiles = [NCExternalFile]()
-
-        guard var serverUrl = NCCommunicationCommon.sharedInstance.encodeString(serverUrl) else {
-            completionHandler(account, externalFiles, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        if serverUrl.last != "/" { serverUrl = serverUrl + "/" }
-        
-        serverUrl = serverUrl + "ocs/v2.php/apps/external/api/v1?format=json"
-        
-        guard let url = NCCommunicationCommon.sharedInstance.StringToUrl(serverUrl) else {
-            completionHandler(account, externalFiles, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "GET")
-        let headers = getStandardHeaders()
-        
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).responseJSON { (response) in
-            debugPrint(response)
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, externalFiles, error.errorCode, error.description)
-            case .success(let json):
-                let json = JSON(json)
-                let ocsdata = json["ocs"]["data"]
-                for (_, subJson):(String, JSON) in ocsdata {
-                    let extrernalFile = NCExternalFile()
-                    if let id = subJson["id"].int { extrernalFile.idExternalSite = id }
-                    if let name = subJson["name"].string { extrernalFile.name = name }
-                    if let url = subJson["url"].string { extrernalFile.url = url }
-                    if let lang = subJson["lang"].string { extrernalFile.lang = lang }
-                    if let icon = subJson["icon"].string { extrernalFile.icon = icon }
-                    if let type = subJson["type"].string { extrernalFile.type = type }
-                    externalFiles.append(extrernalFile)
-                }
-                completionHandler(account, externalFiles, 0, nil)
-            }
-        }
-    }
-    
-    @objc public func getServerStatus(serverUrl: String, completionHandler: @escaping (_ serverProductName: String?, _ serverVersion: String? , _ versionMajor: Int, _ versionMinor: Int, _ versionMicro: Int, _ extendedSupport: Bool, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-                
-        var serverUrl = String(serverUrl)
-        if serverUrl.last != "/" { serverUrl = serverUrl + "/" }
-        serverUrl = serverUrl + "status.php"
-        guard let url = NCCommunicationCommon.sharedInstance.encodeStringToUrl(serverUrl) else {
-            completionHandler(nil, nil, 0, 0, 0, false, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "GET")
-        let headers = getStandardHeaders()
-        
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).responseJSON { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(nil, nil, 0, 0, 0, false, error.errorCode, error.description)
-            case .success(let json):
-                let json = JSON(json)
-                var versionMajor = 0, versionMinor = 0, versionMicro = 0
-                
-                let serverProductName = json["productname"].string?.lowercased() ?? ""
-                let serverVersion = json["version"].string ?? ""
-                let serverVersionString = json["versionstring"].string ?? ""
-                let extendedSupport = json["extendedSupport"].bool ?? false
-                    
-                let arrayVersion = serverVersion.components(separatedBy: ".")
-                if arrayVersion.count == 1 {
-                    versionMajor = Int(arrayVersion[0]) ?? 0
-                } else if arrayVersion.count == 2 {
-                    versionMajor = Int(arrayVersion[0]) ?? 0
-                    versionMinor = Int(arrayVersion[1]) ?? 0
-                } else if arrayVersion.count >= 3 {
-                    versionMajor = Int(arrayVersion[0]) ?? 0
-                    versionMinor = Int(arrayVersion[1]) ?? 0
-                    versionMicro = Int(arrayVersion[2]) ?? 0
-                }
-                
-                completionHandler(serverProductName, serverVersionString, versionMajor, versionMinor, versionMicro, extendedSupport, 0, "")
-            }
-        }
-    }
-    
-    @objc public func downloadAvatar(serverUrl: String, userID: String, fileNameLocalPath: String, size: Int, account: String, completionHandler: @escaping (_ account: String, _ data: Data?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        guard var serverUrl = NCCommunicationCommon.sharedInstance.encodeString(serverUrl) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        if serverUrl.last != "/" { serverUrl = serverUrl + "/" }
-        
-        serverUrl = serverUrl + "index.php/avatar/" + userID + "/\(size)"
-        
-        guard let url = NCCommunicationCommon.sharedInstance.StringToUrl(serverUrl) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "GET")
-        let headers = getStandardHeaders()
-                
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).response { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, error.errorCode, error.description)
-            case .success( _):
-                if let data = response.data {
-                    do {
-                        let url = URL.init(fileURLWithPath: fileNameLocalPath)
-                        try  data.write(to: url, options: .atomic)
-                        completionHandler(account, data, 0, nil)
-                    } catch {
-                        completionHandler(account, nil, error._code, error.localizedDescription)
-                    }
-                } else {
-                    completionHandler(account, nil, NSURLErrorCannotDecodeContentData, "Response error data null")
-                }
-            }
-        }
-    }
-    
-    @objc public func downloadContent(serverUrl: String, account: String, completionHandler: @escaping (_ account: String, _ data: Data?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        guard let url = NCCommunicationCommon.sharedInstance.encodeStringToUrl(serverUrl) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "GET")
-        let headers = getStandardHeaders()
-                
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).response { (response) in
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, error.errorCode, error.description)
-            case .success( _):
-                if let data = response.data {
-                    completionHandler(account, data, 0, nil)
-                } else {
-                    completionHandler(account, nil, NSURLErrorCannotDecodeContentData, "Response error data null")
-                }
-            }
-        }
-    }
-    
-    //MARK: - Edit collaborative with NC Text
-    
-    @objc public func NCTextObtainEditorDetails(serverUrl: String, account: String, completionHandler: @escaping (_ account: String, _  editors: [NCEditorDetailsEditors], _ creators: [NCEditorDetailsCreators], _ errorCode: Int, _ errorDescription: String?) -> Void) {
-        
-        var editors = [NCEditorDetailsEditors]()
-        var creators = [NCEditorDetailsCreators]()
-
-        guard var serverUrl = NCCommunicationCommon.sharedInstance.encodeString(serverUrl) else {
-            completionHandler(account, editors, creators, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        if serverUrl.last != "/" { serverUrl = serverUrl + "/" }
-        
-        serverUrl = serverUrl + "ocs/v2.php/apps/files/api/v1/directEditing?format=json"
-        
-        guard let url = NCCommunicationCommon.sharedInstance.StringToUrl(serverUrl) else {
-            completionHandler(account, editors, creators, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "GET")
-        let headers = getStandardHeaders()
-        
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).responseJSON { (response) in
-            debugPrint(response)
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, editors, creators ,error.errorCode, error.description)
-            case .success(let json):
-                let json = JSON(json)
-                let ocsdataeditors = json["ocs"]["data"]["editors"]
-                for (_, subJson):(String, JSON) in ocsdataeditors {
-                    let editor = NCEditorDetailsEditors()
-                    
-                    if let mimetypes = subJson["mimetypes"].array {
-                        for mimetype in mimetypes {
-                            editor.mimetypes.append(mimetype.string ?? "")
-                        }
-                    }
-                    if let name = subJson["name"].string { editor.name = name }
-                    if let optionalMimetypes = subJson["optionalMimetypes"].array {
-                        for optionalMimetype in optionalMimetypes {
-                            editor.optionalMimetypes.append(optionalMimetype.string ?? "")
-                        }
-                    }
-                    if let secure = subJson["secure"].int { editor.secure = secure }
-                    
-                    editors.append(editor)
-                }
-                
-                let ocsdatacreators = json["ocs"]["data"]["creators"]
-                for (_, subJson):(String, JSON) in ocsdatacreators {
-                    let creator = NCEditorDetailsCreators()
-                    
-                    if let editor = subJson["editor"].string { creator.editor = editor }
-                    if let ext = subJson["extension"].string { creator.ext = ext }
-                    if let identifier = subJson["id"].string { creator.identifier = identifier }
-                    if let mimetype = subJson["mimetype"].string { creator.mimetype = mimetype }
-                    if let name = subJson["name"].string { creator.name = name }
-                    if let templates = subJson["templates"].int { creator.templates = templates }
-
-                    creators.append(creator)
-                }
-                
-                completionHandler(account, editors, creators, 0, nil)
-            }
-        }
-    }
-    
-    @objc public func NCTextOpenFile(serverUrl: String, fileNamePath: String, editor: String, customUserAgent: String?, account: String, completionHandler: @escaping (_ account: String, _  url: String?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-                
-        guard var serverUrl = NCCommunicationCommon.sharedInstance.encodeString(serverUrl) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        if serverUrl.last != "/" { serverUrl = serverUrl + "/" }
-        
-        guard let fileNamePath = NCCommunicationCommon.sharedInstance.encodeString(fileNamePath) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        serverUrl = serverUrl + "ocs/v2.php/apps/files/api/v1/directEditing/open?path=/" + fileNamePath + "&editorId=" + editor + "&format=json"
-        
-        guard let url = NCCommunicationCommon.sharedInstance.StringToUrl(serverUrl) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "POST")
-        var headers = getStandardHeaders()
-        if customUserAgent != nil {
-             headers.update(.userAgent(customUserAgent!))
-        }
-        
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).responseJSON { (response) in
-            debugPrint(response)
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, error.errorCode, error.description)
-            case .success(let json):
-                let json = JSON(json)
-                let url = json["ocs"]["data"]["url"].string
-                completionHandler(account, url, 0, nil)
-            }
-        }
-    }
-    
-    @objc public func NCTextGetListOfTemplates(serverUrl: String, customUserAgent: String?, account: String, completionHandler: @escaping (_ account: String, _  templates: [NCEditorTemplates], _ errorCode: Int, _ errorDescription: String?) -> Void) {
-                
-        var templates = [NCEditorTemplates]()
-
-        guard var serverUrl = NCCommunicationCommon.sharedInstance.encodeString(serverUrl) else {
-            completionHandler(account, templates, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        if serverUrl.last != "/" { serverUrl = serverUrl + "/" }
-        
-        serverUrl = serverUrl + "ocs/v2.php/apps/files/api/v1/directEditing/templates/text/textdocumenttemplate?format=json"
-        
-        guard let url = NCCommunicationCommon.sharedInstance.StringToUrl(serverUrl) else {
-            completionHandler(account, templates, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "GET")
-        var headers = getStandardHeaders()
-        if customUserAgent != nil {
-             headers.update(.userAgent(customUserAgent!))
-        }
-        
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).responseJSON { (response) in
-            debugPrint(response)
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, templates, error.errorCode, error.description)
-            case .success(let json):
-                let json = JSON(json)
-                let ocsdatatemplates = json["ocs"]["data"]["editors"]
-                
-                for (_, subJson):(String, JSON) in ocsdatatemplates {
-                    let template = NCEditorTemplates()
-                                   
-                    if let identifier = subJson["id"].string { template.identifier = identifier }
-                    if let ext = subJson["extension"].string { template.ext = ext }
-                    if let name = subJson["name"].string { template.name = name }
-                    if let preview = subJson["preview"].string { template.preview = preview }
-
-                    templates.append(template)
-                }
-                
-                completionHandler(account, templates, 0, nil)
-            }
-        }
-    }
-    
-    @objc public func NCTextCreateFile(serverUrl: String, fileNamePath: String, editorId: String, creatorId: String, templateId: String, customUserAgent: String?, account: String, completionHandler: @escaping (_ account: String, _  url: String?, _ errorCode: Int, _ errorDescription: String?) -> Void) {
-                
-        guard var serverUrl = NCCommunicationCommon.sharedInstance.encodeString(serverUrl) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        if serverUrl.last != "/" { serverUrl = serverUrl + "/" }
-        
-        guard let fileNamePath = NCCommunicationCommon.sharedInstance.encodeString(fileNamePath) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        if templateId == "" {
-            serverUrl = serverUrl + "ocs/v2.php/apps/files/api/v1/directEditing/create?path=/" + fileNamePath + "&editorId=" + editorId + "&creatorId=" + creatorId + "&format=json"
-        } else {
-            serverUrl = serverUrl + "ocs/v2.php/apps/files/api/v1/directEditing/create?path=/" + fileNamePath + "&editorId=" + editorId + "&creatorId=" + creatorId + "&templateId=" + templateId + "&format=json"
-        }
-        
-        guard let url = NCCommunicationCommon.sharedInstance.StringToUrl(serverUrl) else {
-            completionHandler(account, nil, NSURLErrorUnsupportedURL, "Invalid server url")
-            return
-        }
-        
-        let method = HTTPMethod(rawValue: "POST")
-        var headers = getStandardHeaders()
-        if customUserAgent != nil {
-             headers.update(.userAgent(customUserAgent!))
-        }
-        
-        sessionManager.request(url, method: method, parameters:nil, encoding: URLEncoding.default, headers: headers, interceptor: nil).validate(statusCode: 200..<300).responseJSON { (response) in
-            debugPrint(response)
-            switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, error.errorCode, error.description)
-            case .success(let json):
-                let json = JSON(json)
-                let url = json["ocs"]["data"]["url"].string
-                completionHandler(account, url, 0, nil)
-            }
-        }
-    }
-    
-    //MARK: - File transfer
-    
-    @objc public func download(serverUrlFileName: String, fileNameLocalPath: String, account: String, progressHandler: @escaping (_ progress: Progress) -> Void , completionHandler: @escaping (_ account: String, _ etag: String?, _ date: NSDate?, _ lenght: Double, _ errorCode: Int, _ errorDescription: String?) -> Void) -> URLSessionTask? {
-        
-        guard let url = NCCommunicationCommon.sharedInstance.encodeStringToUrl(serverUrlFileName) else {
-            completionHandler(account, nil, nil, 0, NSURLErrorUnsupportedURL, "Invalid server url")
-            return nil
         }
         
         var destination: Alamofire.DownloadRequest.Destination?
@@ -966,84 +165,182 @@ import SwiftyJSON
         }
         destination = destinationFile
         
-        let headers = getStandardHeaders()
+        let headers = NCCommunicationCommon.shared.getStandardHeaders(addCustomHeaders, customUserAgent: customUserAgent)
         
-        let request = sessionManager.download(url, method: .get, parameters: nil, encoding: URLEncoding.default, headers: headers, interceptor: nil, to: destination)
-        .downloadProgress { progress in
+        let request = sessionManager.download(url, method: .get, parameters: nil, encoding: URLEncoding.default, headers: headers, interceptor: nil, to: destination).validate(statusCode: 200..<300).downloadProgress { progress in
+            
             progressHandler(progress)
-        }
-        .validate(statusCode: 200..<300)
-        .response { response in
+            
+        } .response { response in
+            
             switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, nil, 0, error.errorCode, error.description)
+            case .failure(let error):
+                let resultError = NCCommunicationError().getError(error: error, httResponse: response.response)
+                completionHandler(account, nil, nil, 0, error, resultError.errorCode, resultError.description ?? "")
             case .success( _):
-                let length = response.response?.allHeaderFields["length"] as? Double ?? 0
-                var etag = NCCommunicationCommon.sharedInstance.findHeader("OC-ETag", allHeaderFields: response.response?.allHeaderFields)
-                if etag != nil { etag = etag!.replacingOccurrences(of: "\"", with: "") }
-                if let dateString = NCCommunicationCommon.sharedInstance.findHeader("Date", allHeaderFields: response.response?.allHeaderFields) {
-                    if let date = NCCommunicationCommon.sharedInstance.convertDate(dateString, format: "EEE, dd MMM y HH:mm:ss zzz") {
-                        completionHandler(account, etag, date, length, 0, nil)
-                    } else { completionHandler(account, nil, nil, 0, NSURLErrorBadServerResponse, "Response error decode date format") }
-                } else { completionHandler(account, nil, nil, 0, NSURLErrorBadServerResponse, "Response error decode date format") }
+
+                var date: NSDate?
+                var etag: String?
+                var length: Double = 0
+                
+                if let result = response.response?.allHeaderFields["Content-Length"] as? String {
+                    length = Double(result) ?? 0
+                }
+                
+                if NCCommunicationCommon.shared.findHeader("oc-etag", allHeaderFields: response.response?.allHeaderFields) != nil {
+                    etag = NCCommunicationCommon.shared.findHeader("oc-etag", allHeaderFields: response.response?.allHeaderFields)
+                } else if NCCommunicationCommon.shared.findHeader("etag", allHeaderFields: response.response?.allHeaderFields) != nil {
+                    etag = NCCommunicationCommon.shared.findHeader("etag", allHeaderFields: response.response?.allHeaderFields)
+                }
+                
+                if etag != nil {
+                    etag = etag!.replacingOccurrences(of: "\"", with: "")
+                }
+                
+                if let dateString = NCCommunicationCommon.shared.findHeader("Date", allHeaderFields: response.response?.allHeaderFields) {
+                    date = NCCommunicationCommon.shared.convertDate(dateString, format: "EEE, dd MMM y HH:mm:ss zzz")
+                }
+                
+                completionHandler(account, etag, date, length, nil , 0, "")
             }
         }
         
-        return request.task
+        DispatchQueue.main.async {
+            requestHandler(request)
+        }
     }
     
-    @objc public func upload(serverUrlFileName: String, fileNameLocalPath: String, dateCreationFile: Date?, dateModificationFile: Date?, account: String, progressHandler: @escaping (_ progress: Progress) -> Void ,completionHandler: @escaping (_ account: String, _ ocId: String?, _ etag: String?, _ date: NSDate?, _ size: Int64, _ errorCode: Int, _ errorDescription: String?) -> Void) -> URLSessionTask? {
+    @objc public func upload(serverUrlFileName: String, fileNameLocalPath: String, dateCreationFile: Date?, dateModificationFile: Date?, customUserAgent: String? = nil, addCustomHeaders: [String: String]? = nil, progressHandler: @escaping (_ progress: Progress) -> Void ,completionHandler: @escaping (_ account: String, _ ocId: String?, _ etag: String?, _ date: NSDate?, _ size: Int64, _ errorCode: Int, _ errorDescription: String) -> Void) {
         
-        guard let url = NCCommunicationCommon.sharedInstance.encodeStringToUrl(serverUrlFileName) else {
-            completionHandler(account, nil, nil, nil, 0, NSURLErrorUnsupportedURL, "Invalid server url")
-            return nil
+        upload(serverUrlFileName: serverUrlFileName, fileNameLocalPath: fileNameLocalPath, dateCreationFile: dateCreationFile, dateModificationFile: dateModificationFile, requestHandler: { (_) in }, progressHandler: progressHandler) { (account, ocId, etag, date, size, error, errorCode, errorDescription) in
+            
+            completionHandler(account, ocId, etag, date, size, errorCode, errorDescription)
+        }
+    }
+
+    public func upload(serverUrlFileName: String, fileNameLocalPath: String, dateCreationFile: Date?, dateModificationFile: Date?, customUserAgent: String? = nil, addCustomHeaders: [String: String]? = nil, requestHandler: @escaping (_ request: UploadRequest) -> Void, progressHandler: @escaping (_ progress: Progress) -> Void ,completionHandler: @escaping (_ account: String, _ ocId: String?, _ etag: String?, _ date: NSDate?, _ size: Int64, _ error: AFError?, _ errorCode: Int, _ errorDescription: String) -> Void) {
+        
+        let account = NCCommunicationCommon.shared.account
+        var size: Int64 = 0
+
+        guard let url = NCCommunicationCommon.shared.encodeStringToUrl(serverUrlFileName) else {
+            completionHandler(account, nil, nil, nil, 0, nil, NSURLErrorBadURL, NSLocalizedString("_invalid_url_", value: "Invalid server url", comment: ""))
+            return
         }
         let fileNameLocalPathUrl = URL.init(fileURLWithPath: fileNameLocalPath)
         
-        var headers = getStandardHeaders()
+        var headers = NCCommunicationCommon.shared.getStandardHeaders(addCustomHeaders, customUserAgent: customUserAgent)
         if dateCreationFile != nil {
             let sDate = "\(dateCreationFile?.timeIntervalSince1970 ?? 0)"
-            headers.update(name: "X-OC-Ctime", value: sDate)
+            headers.update(name: "X-OC-CTime", value: sDate)
         }
         if dateModificationFile != nil {
             let sDate = "\(dateModificationFile?.timeIntervalSince1970 ?? 0)"
-            headers.update(name: "X-OC-Mtime", value: sDate)
+            headers.update(name: "X-OC-MTime", value: sDate)
         }
         
-        var size: Int64 = 0
-        let request = sessionManager.upload(fileNameLocalPathUrl, to: url, method: .put, headers: headers, interceptor: nil, fileManager: .default)
-        .uploadProgress { progress in
+        let request = sessionManager.upload(fileNameLocalPathUrl, to: url, method: .put, headers: headers, interceptor: nil, fileManager: .default).validate(statusCode: 200..<300).uploadProgress { progress in
+            
             progressHandler(progress)
             size = progress.totalUnitCount
         }
-        .validate(statusCode: 200..<300)
+    
         .response { response in
+            
             switch response.result {
-            case.failure(let error):
-                let error = NCCommunicationError().getError(error: error, httResponse: response.response)
-                completionHandler(account, nil, nil, nil, 0, error.errorCode, error.description)
+            case .failure(let error):
+                let resultError = NCCommunicationError().getError(error: error, httResponse: response.response)
+                completionHandler(account, nil, nil, nil, 0, error, resultError.errorCode, resultError.description ?? "")
             case .success( _):
-                let ocId = NCCommunicationCommon.sharedInstance.findHeader("oc-fileid", allHeaderFields: response.response?.allHeaderFields)
-                var etag = NCCommunicationCommon.sharedInstance.findHeader("oc-etag", allHeaderFields: response.response?.allHeaderFields)
+                var ocId: String?, etag: String?
+                
+                if NCCommunicationCommon.shared.findHeader("oc-fileid", allHeaderFields: response.response?.allHeaderFields) != nil {
+                    ocId = NCCommunicationCommon.shared.findHeader("oc-fileid", allHeaderFields: response.response?.allHeaderFields)
+                } else if NCCommunicationCommon.shared.findHeader("fileid", allHeaderFields: response.response?.allHeaderFields) != nil {
+                    ocId = NCCommunicationCommon.shared.findHeader("fileid", allHeaderFields: response.response?.allHeaderFields)
+                }
+                
+                if NCCommunicationCommon.shared.findHeader("oc-etag", allHeaderFields: response.response?.allHeaderFields) != nil {
+                    etag = NCCommunicationCommon.shared.findHeader("oc-etag", allHeaderFields: response.response?.allHeaderFields)
+                } else if NCCommunicationCommon.shared.findHeader("etag", allHeaderFields: response.response?.allHeaderFields) != nil {
+                    etag = NCCommunicationCommon.shared.findHeader("etag", allHeaderFields: response.response?.allHeaderFields)
+                }
+                
                 if etag != nil { etag = etag!.replacingOccurrences(of: "\"", with: "") }
-                if let dateString = NCCommunicationCommon.sharedInstance.findHeader("date", allHeaderFields: response.response?.allHeaderFields) {
-                    if let date = NCCommunicationCommon.sharedInstance.convertDate(dateString, format: "EEE, dd MMM y HH:mm:ss zzz") {
-                        completionHandler(account, ocId, etag, date, size, 0, nil)
-                    } else { completionHandler(account, nil, nil, nil, 0, NSURLErrorBadServerResponse, "Response error decode date format") }
-                } else { completionHandler(account, nil, nil, nil, 0, NSURLErrorBadServerResponse, "Response error decode date format") }
+                
+                if let dateString = NCCommunicationCommon.shared.findHeader("date", allHeaderFields: response.response?.allHeaderFields) {
+                    if let date = NCCommunicationCommon.shared.convertDate(dateString, format: "EEE, dd MMM y HH:mm:ss zzz") {
+                        completionHandler(account, ocId, etag, date, size, nil, 0, "")
+                    } else {
+                        completionHandler(account, nil, nil, nil, 0, nil, NSURLErrorBadServerResponse, NSLocalizedString("_invalid_date_format_", value: "Invalid date format", comment: ""))
+                    }
+                } else {
+                    completionHandler(account, nil, nil, nil, 0, nil, NSURLErrorBadServerResponse, NSLocalizedString("_invalid_date_format_", value: "Invalid date format", comment: ""))
+                }
             }
         }
         
-        return request.task
+        DispatchQueue.main.async {
+            requestHandler(request)
+        }
     }
     
     //MARK: - SessionDelegate
 
     public func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        NCCommunicationCommon.sharedInstance.authenticationChallenge(challenge, completionHandler: { (authChallengeDisposition, credential) in
-            completionHandler(authChallengeDisposition, credential)
-        })
+        
+        if NCCommunicationCommon.shared.delegate == nil {
+            completionHandler(URLSession.AuthChallengeDisposition.performDefaultHandling, nil)
+        } else {
+            NCCommunicationCommon.shared.delegate?.authenticationChallenge?(challenge, completionHandler: { (authChallengeDisposition, credential) in
+                completionHandler(authChallengeDisposition, credential)
+            })
+        }
     }
 }
 
+final class AlamofireLogger: EventMonitor {
+
+    func requestDidResume(_ request: Request) {
+        
+        if NCCommunicationCommon.shared.levelLog > 0 {
+        
+            NCCommunicationCommon.shared.writeLog("Network request started: \(request)")
+        
+            if NCCommunicationCommon.shared.levelLog > 1 {
+                
+                let allHeaders = request.request.flatMap { $0.allHTTPHeaderFields.map { $0.description } } ?? "None"
+                let body = request.request.flatMap { $0.httpBody.map { String(decoding: $0, as: UTF8.self) } } ?? "None"
+                
+                NCCommunicationCommon.shared.writeLog("Network request headers: \(allHeaders)")
+                NCCommunicationCommon.shared.writeLog("Network request body: \(body)")
+            }
+        }
+    }
+    
+    func request<Value>(_ request: DataRequest, didParseResponse response: AFDataResponse<Value>) {
+        
+        guard let date = NCCommunicationCommon.shared.convertDate(Date(), format: "yyyy-MM-dd' 'HH:mm:ss") else { return }
+        let responseResultString = String.init("\(response.result)")
+        let responseDebugDescription = String.init("\(response.debugDescription)")
+        let responseAllHeaderFields = String.init("\(String(describing: response.response?.allHeaderFields))")
+        
+        if NCCommunicationCommon.shared.levelLog > 0 {
+            
+            if NCCommunicationCommon.shared.levelLog == 1 {
+                
+                if let request = response.request {
+                    let requestString = "\(request)"
+                    NCCommunicationCommon.shared.writeLog("Network response request: " + requestString + ", result: " + responseResultString)
+                } else {
+                    NCCommunicationCommon.shared.writeLog("Network response result: " + responseResultString)
+                }
+                
+            } else {
+                
+                NCCommunicationCommon.shared.writeLog("Network response result: \(date) " + responseDebugDescription)
+                NCCommunicationCommon.shared.writeLog("Network response all headers: \(date) " + responseAllHeaderFields)
+            }
+        }
+    }
+}

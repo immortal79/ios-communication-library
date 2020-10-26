@@ -22,18 +22,24 @@
 //
 
 import Foundation
+import UIKit
 import Alamofire
+import MobileCoreServices
 
 @objc public protocol NCCommunicationCommonDelegate {
+    
     @objc optional func authenticationChallenge(_ challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void)
-    @objc optional func downloadProgress(_ progress: Double, fileName: String, ServerUrl: String, session: URLSession, task: URLSessionTask)
-    @objc optional func uploadProgress(_ progress: Double, fileName: String, ServerUrl: String, session: URLSession, task: URLSessionTask)
-    @objc optional func downloadComplete(fileName: String, serverUrl: String, etag: String?, date: NSDate?, dateLastModified: NSDate?, length: Double, description: String?, error: Error?, statusCode: Int)
-    @objc optional func uploadComplete(fileName: String, serverUrl: String, ocId: String?, etag: String?, date: NSDate?, size: Int64, description: String?, error: Error?, statusCode: Int)
+    
+    @objc optional func networkReachabilityObserver(_ typeReachability: NCCommunicationCommon.typeReachability)
+    
+    @objc optional func downloadProgress(_ progress: Double, totalBytes: Int64, totalBytesExpected: Int64, fileName: String, serverUrl: String, session: URLSession, task: URLSessionTask)
+    @objc optional func uploadProgress(_ progress: Double, totalBytes: Int64, totalBytesExpected: Int64, fileName: String, serverUrl: String, session: URLSession, task: URLSessionTask)
+    @objc optional func downloadComplete(fileName: String, serverUrl: String, etag: String?, date: NSDate?, dateLastModified: NSDate?, length: Double, description: String?, task: URLSessionTask, errorCode: Int, errorDescription: String)
+    @objc optional func uploadComplete(fileName: String, serverUrl: String, ocId: String?, etag: String?, date: NSDate?, size: Int64, description: String?, task: URLSessionTask, errorCode: Int, errorDescription: String)
 }
 
 @objc public class NCCommunicationCommon: NSObject {
-    @objc public static let sharedInstance: NCCommunicationCommon = {
+    @objc public static var shared: NCCommunicationCommon = {
         let instance = NCCommunicationCommon()
         return instance
     }()
@@ -41,88 +47,291 @@ import Alamofire
     var user = ""
     var userId = ""
     var password = ""
-    var url = ""
+    var account = ""
+    var urlBase = ""
     var userAgent: String?
-    var capabilitiesGroup: String?
     var nextcloudVersion: Int = 0
-    var webDavRoot: String = "remote.php/webdav"
-    var davRoot: String = "remote.php/dav"
+    var webDav: String = "remote.php/webdav"
+    var dav: String = "remote.php/dav"
     
-    // Protocol
+    var cookies: [String:[HTTPCookie]] = [:]
+
     var delegate: NCCommunicationCommonDelegate?
     
-    // Session
-    @objc let sessionMaximumConnectionsPerHost = 5
-    @objc let sessionIdentifierBackground: String = "com.nextcloud.session.background"
-    @objc let sessionIdentifierBackgroundwifi: String = "com.nextcloud.session.backgroundwifi"
-    @objc let sessionIdentifierExtension: String = "com.nextcloud.session.extension"
-        
+    @objc public let sessionIdentifierDownload: String = "com.nextcloud.session.download"
+    @objc public let sessionIdentifierUpload: String = "com.nextcloud.session.upload"
+
+    @objc public enum typeReachability: Int {
+        case unknown = 0
+        case notReachable = 1
+        case reachableEthernetOrWiFi = 2
+        case reachableCellular = 3
+    }
+    
+    public enum typeFile: String {
+        case audio = "audio"
+        case compress = "compress"
+        case directory = "directory"
+        case document = "document"
+        case image = "image"
+        case imagemeter = "imagemeter"
+        case unknow = "unknow"
+        case video = "video"
+    }
+
+    private enum iconName: String {
+        case audio = "file_audio"
+        case code = "file_code"
+        case compress = "file_compress"
+        case directory = "directory"
+        case document = "document"
+        case image = "file_photo"
+        case imagemeter = "imagemeter"
+        case movie = "file_movie"
+        case pdf = "file_pdf"
+        case ppt = "file_ppt"
+        case txt = "file_txt"
+        case unknow = "file"
+        case xls = "file_xls"
+    }
+    
+    private var filenameLog: String = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first! + "/communication.log"
+    var levelLog: Int = 0
+
+    //MARK: - Init
+    
+    override init() {
+    }
+    
     //MARK: - Setup
     
-    @objc public func setup(user: String, userId: String, password: String, url: String, userAgent: String?, capabilitiesGroup: String?, nextcloudVersion: Int, delegate: NCCommunicationCommonDelegate?) {
+    @objc public func setup(account: String? = nil, user: String, userId: String, password: String, urlBase: String, userAgent: String, webDav: String?, dav: String?, nextcloudVersion: Int, delegate: NCCommunicationCommonDelegate?) {
         
+        self.setup(account:account, user: user, userId: userId, password: password, urlBase: urlBase)
+        self.setup(userAgent: userAgent)
+        if (webDav != nil) { self.setup(webDav: webDav!) }
+        if (dav != nil) { self.setup(dav: dav!) }
+        self.setup(nextcloudVersion: nextcloudVersion)
+        self.setup(delegate: delegate)
+    }
+    
+    @objc public func setup(account: String? = nil, user: String, userId: String, password: String, urlBase: String) {
+        
+        if self.account != account {
+            NotificationCenter.default.post(name: Notification.Name.init(rawValue: "changeUser"), object: nil)
+        }
+        
+        if account == nil { self.account = "" } else { self.account = account! }
         self.user = user
         self.userId = userId
         self.password = password
-        self.url = url
+        self.urlBase = urlBase
+    }
+    
+    @objc public func setup(delegate: NCCommunicationCommonDelegate?) {
+        
+        self.delegate = delegate
+    }
+    
+    @objc public func setup(userAgent: String) {
+        
         self.userAgent = userAgent
-        self.capabilitiesGroup = capabilitiesGroup
+    }
+    
+    @objc public func setup(webDav: String) {
+        
+        self.webDav = webDav
+        
+        if webDav.first == "/" { self.webDav = String(self.webDav.dropFirst()) }
+        if webDav.last == "/" { self.webDav = String(self.webDav.dropLast()) }
+    }
+    
+    @objc public func setup(dav: String) {
+        
+        self.dav = dav
+        
+        if dav.first == "/" { self.dav = String(self.dav.dropFirst()) }
+        if dav.last == "/" { self.dav = String(self.dav.dropLast()) }
+    }
+    
+    @objc public func setup(nextcloudVersion: Int) {
+        
         self.nextcloudVersion = nextcloudVersion
-        self.delegate = delegate
     }
     
-    @objc public func setup(userAgent: String?, capabilitiesGroup: String?, delegate: NCCommunicationCommonDelegate?) {
+    //MARK: -
+    
+    @objc public func remove(account: String) {
         
-        self.userAgent = userAgent
-        self.capabilitiesGroup = capabilitiesGroup
-        self.delegate = delegate
+        cookies[account] = nil
     }
+        
+    //MARK: -  Common public
     
-    @objc public func setup(webDavRoot: String) {
+    @objc public func objcGetInternalContenType(fileName: String, contentType: String, directory: Bool) -> [String: String] {
+                
+        let results = getInternalContenType(fileName: fileName , contentType: contentType, directory: directory)
         
-        self.webDavRoot = webDavRoot
-        
-        if webDavRoot.first == "/" { self.webDavRoot = String(self.webDavRoot.dropFirst()) }
-        if webDavRoot.last == "/" { self.webDavRoot = String(self.webDavRoot.dropLast()) }
+        return ["contentType":results.contentType, "typeFile":results.typeFile, "iconName":results.iconName, "typeIdentifier":results.typeIdentifier, "fileNameWithoutExt":results.fileNameWithoutExt, "ext":results.ext]
     }
-    
-    @objc public func setup(davRoot: String) {
+
+    public func getInternalContenType(fileName: String, contentType: String, directory: Bool) -> (contentType: String, typeFile: String, iconName: String, typeIdentifier: String, fileNameWithoutExt: String, ext: String) {
         
-        self.davRoot = davRoot
+        var resultContentType = contentType
+        var resultTypeFile = "", resultIconName = "", resultTypeIdentifier = "", fileNameWithoutExt = "", ext = ""
         
-        if davRoot.first == "/" { self.davRoot = String(self.davRoot.dropFirst()) }
-        if davRoot.last == "/" { self.davRoot = String(self.davRoot.dropLast()) }
-    }
-    
-    //MARK: -  Delegate session
-    
-    public func authenticationChallenge(_ challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        if delegate == nil {
-            completionHandler(URLSession.AuthChallengeDisposition.performDefaultHandling, nil)
-        } else {
-            delegate?.authenticationChallenge?(challenge, completionHandler: { (authChallengeDisposition, credential) in
-                completionHandler(authChallengeDisposition, credential)
-            })
+        // UTI
+        if let unmanagedFileUTI = UTTypeCreatePreferredIdentifierForTag(kUTTagClassFilenameExtension, (fileName as NSString).pathExtension as CFString, nil) {
+            let fileUTI = unmanagedFileUTI.takeRetainedValue()
+            ext = (fileName as NSString).pathExtension.lowercased()
+            fileNameWithoutExt = (fileName as NSString).deletingPathExtension
+            
+            // contentType detect
+            if contentType == "" {
+                if let mimeUTI = UTTypeCopyPreferredTagWithClass(fileUTI, kUTTagClassMIMEType) {
+                    resultContentType = mimeUTI.takeRetainedValue() as String
+                }
+            }
+            
+            // TypeIdentifier
+            resultTypeIdentifier = fileUTI as String
+
+            if directory {
+                resultContentType = "httpd/unix-directory"
+                resultTypeFile = typeFile.directory.rawValue
+                resultIconName = iconName.directory.rawValue
+                resultTypeIdentifier = kUTTypeFolder as String
+            } else if ext == "imi" {
+                resultTypeFile = typeFile.imagemeter.rawValue
+                resultIconName = iconName.imagemeter.rawValue
+            } else {
+                let type = convertUTItoResultType(fileUTI: fileUTI)
+                resultTypeFile = type.resultTypeFile
+                resultIconName = type.resultIconName
+            }
         }
+        
+        return(contentType: resultContentType, typeFile: resultTypeFile, iconName: resultIconName, typeIdentifier: resultTypeIdentifier, fileNameWithoutExt: fileNameWithoutExt, ext: ext)
     }
     
-    public func downloadProgress(_ progress: Double, fileName: String, ServerUrl: String, session: URLSession, task: URLSessionTask) {
-        delegate?.downloadProgress?(progress, fileName: fileName, ServerUrl: ServerUrl, session: session, task: task)
-    }
-
-    public func uploadProgress(_ progress: Double, fileName: String, ServerUrl: String, session: URLSession, task: URLSessionTask) {
-        delegate?.uploadProgress?(progress, fileName: fileName, ServerUrl: ServerUrl, session: session, task: task)
+    public func convertUTItoResultType(fileUTI: CFString) -> (resultTypeFile: String, resultIconName: String, resultFilename: String, resultExtension: String) {
+    
+        var resultTypeFile: String
+        var resultIconName: String
+        var resultFileName: String
+        var resultExtension: String
+        
+        if UTTypeConformsTo(fileUTI, kUTTypeImage) {
+            resultTypeFile = typeFile.image.rawValue
+            resultIconName = iconName.image.rawValue
+            resultFileName = "image"
+            resultExtension = "jpg"
+        } else if UTTypeConformsTo(fileUTI, kUTTypeMovie) {
+            resultTypeFile = typeFile.video.rawValue
+            resultIconName = iconName.movie.rawValue
+            resultFileName = "movie"
+            resultExtension = "mov"
+        } else if UTTypeConformsTo(fileUTI, kUTTypeAudio) {
+            resultTypeFile = typeFile.audio.rawValue
+            resultIconName = iconName.audio.rawValue
+            resultFileName = "audio"
+            resultExtension = "mp3"
+        } else if UTTypeConformsTo(fileUTI, kUTTypePDF) {
+            resultTypeFile = typeFile.document.rawValue
+            resultIconName = iconName.pdf.rawValue
+            resultFileName = "document"
+            resultExtension = "pdf"
+        } else if UTTypeConformsTo(fileUTI, kUTTypeRTF) {
+            resultTypeFile = typeFile.document.rawValue
+            resultIconName = iconName.txt.rawValue
+            resultFileName = "document"
+            resultExtension = "rtf"
+        } else if UTTypeConformsTo(fileUTI, kUTTypeText) {
+            resultTypeFile = typeFile.document.rawValue
+            resultIconName = iconName.txt.rawValue
+            resultFileName = "document"
+            resultExtension = "txt"
+        } else if UTTypeConformsTo(fileUTI, kUTTypeContent) {
+            resultTypeFile = typeFile.document.rawValue
+            if fileUTI as String == "org.openxmlformats.wordprocessingml.document" {
+                resultIconName = iconName.document.rawValue
+                resultFileName = "document"
+                resultExtension = "docx"
+            } else if fileUTI as String == "com.microsoft.word.doc" {
+                resultIconName = iconName.document.rawValue
+                resultFileName = "document"
+                resultExtension = "doc"
+            } else if fileUTI as String == "org.openxmlformats.spreadsheetml.sheet" {
+                resultIconName = iconName.xls.rawValue
+                resultFileName = "document"
+                resultExtension = "xlsx"
+            } else if fileUTI as String == "com.microsoft.excel.xls" {
+                resultIconName = iconName.xls.rawValue
+                resultFileName = "document"
+                resultExtension = "xls"
+            } else if fileUTI as String == "org.openxmlformats.presentationml.presentation" {
+                resultIconName = iconName.ppt.rawValue
+                resultFileName = "document"
+                resultExtension = "pptx"
+            } else if fileUTI as String == "com.microsoft.powerpoint.ppt" {
+                resultIconName = iconName.ppt.rawValue
+                resultFileName = "document"
+                resultExtension = "ppt"
+            } else if fileUTI as String == "public.plain-text" {
+                resultIconName = iconName.txt.rawValue
+                resultFileName = "document"
+                resultExtension = "text"
+            } else if fileUTI as String == "public.html" {
+                resultIconName = iconName.code.rawValue
+                resultFileName = "document"
+                resultExtension = "html"
+            } else {
+                resultIconName = iconName.document.rawValue
+                resultFileName = "document"
+                resultExtension = ""
+            }
+        } else if UTTypeConformsTo(fileUTI, kUTTypeZipArchive) {
+            resultTypeFile = typeFile.compress.rawValue
+            resultIconName = iconName.compress.rawValue
+            resultFileName = "archive"
+            resultExtension = "zip"
+        } else {
+            resultTypeFile = typeFile.unknow.rawValue
+            resultIconName = iconName.unknow.rawValue
+            resultFileName = "file"
+            resultExtension = ""
+        }
+        
+        return(resultTypeFile, resultIconName, resultFileName, resultExtension)
     }
     
-    public func uploadComplete(fileName: String, serverUrl: String, ocId: String?, etag: String?, date: NSDate?, size: Int64, description: String?, error: Error?, statusCode: Int) {
-        delegate?.uploadComplete?(fileName: fileName, serverUrl: serverUrl, ocId: ocId, etag: etag, date: date, size: size, description: description, error: error, statusCode: statusCode)
-    }
-    
-    public func downloadComplete(fileName: String, serverUrl: String, etag: String?, date: NSDate?, dateLastModified: NSDate?, length: Double, description: String?, error: Error?, statusCode: Int) {
-        delegate?.downloadComplete?(fileName: fileName, serverUrl: serverUrl, etag: etag, date: date, dateLastModified: dateLastModified, length: length, description: description, error: error, statusCode: statusCode)
-    }
-
     //MARK: - Common
+        
+    func getStandardHeaders(_ appendHeaders: [String: String]?, customUserAgent: String?, e2eToken: String? = nil) -> HTTPHeaders {
+        
+        return getStandardHeaders(user: user, password: password, appendHeaders: appendHeaders, customUserAgent: customUserAgent, e2eToken: e2eToken)
+    }
+    
+    func getStandardHeaders(user: String, password: String, appendHeaders: [String: String]?, customUserAgent: String?, e2eToken: String? = nil) -> HTTPHeaders {
+        
+        var headers: HTTPHeaders = [.authorization(username: user, password: password)]
+        if customUserAgent != nil {
+            headers.update(.userAgent(customUserAgent!))
+        } else if let userAgent = userAgent {
+            headers.update(.userAgent(userAgent))
+        }
+        headers.update(.contentType("application/x-www-form-urlencoded"))
+        headers.update(name: "OCS-APIRequest", value: "true")
+        if e2eToken != nil {
+            headers.update(name: "e2e-token", value: e2eToken!)
+        }
+        
+        for (key, value) in appendHeaders ?? [:] {
+            headers.update(name: key, value: value)
+        }
+        
+        return headers
+    }
     
     func convertDate(_ dateString: String, format: String) -> NSDate? {
         
@@ -146,22 +355,21 @@ import Alamofire
         
     func encodeStringToUrl(_ string: String) -> URLConvertible? {
         
-        if let escapedString = string.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            var url: URLConvertible
-            do {
-                try url = escapedString.asURL()
-                return url
-            } catch _ {
-                return nil
-            }
+        if let escapedString = encodeString(string) {
+            return StringToUrl(escapedString)
         }
         return nil
     }
     
     func encodeString(_ string: String) -> String? {
-        return string.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)
-    }
         
+        let encodeCharacterSet = " #;?@&=$+{}<>,!'*|%"
+        let allowedCharacterSet = (CharacterSet(charactersIn: encodeCharacterSet).inverted)
+        let encodeString = string.addingPercentEncoding(withAllowedCharacters: allowedCharacterSet)
+        
+        return encodeString
+    }
+    
     func StringToUrl(_ string: String) -> URLConvertible? {
         
         var url: URLConvertible
@@ -172,7 +380,16 @@ import Alamofire
             return nil
         }
     }
+    
+    func createStandardUrl(serverUrl: String, endpoint: String) -> URLConvertible? {
         
+        guard var serverUrl = encodeString(serverUrl) else { return nil }
+        if serverUrl.last != "/" { serverUrl = serverUrl + "/" }
+        
+        serverUrl = serverUrl + endpoint
+        
+        return StringToUrl(serverUrl)
+    }
     
     func findHeader(_ header: String, allHeaderFields: [AnyHashable : Any]?) -> String? {
        
@@ -183,5 +400,99 @@ import Alamofire
             return headerValue.1
         }
         return nil
+    }
+    
+    func getHostName(urlString: String) -> String? {
+        
+        if let url = URL(string: urlString) {
+            guard let hostName = url.host else { return nil }
+            guard let scheme = url.scheme else { return nil }
+            if let port = url.port {
+                return scheme + "://" + hostName + ":" + String(port)
+            }
+            return scheme + "://" + hostName
+        }
+        return nil
+    }
+    
+    func getHostNameComponent(urlString: String) -> String? {
+        
+        if let url = URL(string: urlString) {
+            let components = url.pathComponents
+            return components.joined(separator: "")
+        }
+        return nil
+    }
+    
+    func resizeImage(image: UIImage, toHeight: CGFloat) -> UIImage {
+        return autoreleasepool { () -> UIImage in
+            let toWidth = image.size.width * (toHeight/image.size.height)
+            let targetSize = CGSize(width: toWidth, height: toHeight)
+            let size = image.size
+           
+            let widthRatio  = targetSize.width  / size.width
+            let heightRatio = targetSize.height / size.height
+           
+            // Orientation detection
+            var newSize: CGSize
+            if(widthRatio > heightRatio) {
+                newSize = CGSize(width: size.width * heightRatio, height: size.height * heightRatio)
+            } else {
+                newSize = CGSize(width: size.width * widthRatio,  height: size.height * widthRatio)
+            }
+           
+            // Calculated rect
+            let rect = CGRect(x: 0, y: 0, width: newSize.width, height: newSize.height)
+           
+            // Resize
+            UIGraphicsBeginImageContextWithOptions(newSize, false, 1.0)
+            image.draw(in: rect)
+           
+            let newImage = UIGraphicsGetImageFromCurrentImageContext()
+            UIGraphicsEndImageContext()
+           
+            return newImage!
+        }
+    }
+    
+    //MARK: - Log
+
+    @objc public func setFileLog(level: Int) {
+        
+        self.levelLog = level
+    }
+    
+    @objc public func getFileNameLog() -> String {
+        
+        return self.filenameLog
+    }
+    
+    @objc public func setFileNameLog(_ filenameLog: String) {
+        
+        self.filenameLog = filenameLog
+    }
+    
+    @objc public func clearFileLog() {
+
+        FileManager.default.createFile(atPath: filenameLog, contents: nil, attributes: nil)
+    }
+    
+    @objc public func writeLog(_ text: String?) {
+        guard let text = text else { return }
+        
+        if levelLog > 0 {
+            guard let date = NCCommunicationCommon.shared.convertDate(Date(), format: "yyyy-MM-dd' 'HH:mm:ss") else { return }
+            let textToWrite = "\(date) " + text + "\n"
+            
+            guard let data = textToWrite.data(using: .utf8) else { return }
+            if !FileManager.default.fileExists(atPath: filenameLog) {
+                FileManager.default.createFile(atPath: filenameLog, contents: nil, attributes: nil)
+            }            
+            if let fileHandle = FileHandle(forWritingAtPath: filenameLog) {
+                fileHandle.seekToEndOfFile()
+                fileHandle.write(data)
+                fileHandle.closeFile()
+            }
+        }
     }
  }
