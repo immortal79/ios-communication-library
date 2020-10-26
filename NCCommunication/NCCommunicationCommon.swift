@@ -445,7 +445,7 @@ import MobileCoreServices
             let rect = CGRect(x: 0, y: 0, width: newSize.width, height: newSize.height)
            
             // Resize
-            UIGraphicsBeginImageContextWithOptions(newSize, false, 1.0)
+            UIGraphicsBeginImageContextWithOptions(newSize, false, UIScreen.main.scale)
             image.draw(in: rect)
            
             let newImage = UIGraphicsGetImageFromCurrentImageContext()
